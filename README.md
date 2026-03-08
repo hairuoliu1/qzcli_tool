@@ -1,253 +1,171 @@
-# qzcli - 启智平台任务管理 CLI
+# qzcli - 启智平台核心 CLI
 
-一个类似 kubectl/docker 风格的 CLI 工具，用于管理启智平台任务。
-
-## 特性
-
-- **一键登录**: `qzcli login` 通过 CAS 认证自动获取 cookie，无需手动复制
-- **资源发现**: `qzcli res -u` 自动发现工作空间、计算组、规格等资源并本地缓存
-- **节点查询**: `qzcli avail` 查询各计算组空余节点，支持低优任务统计
-- **任务列表**: 美观的卡片式显示，完整 URL 方便点击
-- **状态监控**: watch 模式实时跟踪任务进度
-
-开启启智的极致hack
-```bash
-qzcli login -u 用户名 -p 密码 && qzcli avail
- 
-```
-```
-分布式
-  计算组                          空节点     总节点     空GPU GPU类型     
-  -----------------------------------------------------------------
-  某gpu2-3号机房-2                    3      xxx  x/xxx 某gpu2      
-  某gpu2-3号机房                      0      xxx   x/xxx 某gpu2      
-  某gpu2-2号机房                      0      xxx   x/xxx 某gpu2      
-  cuda12.8版本某gpu1                 0      xxx  x/xxx 某gpu1   
-```
+本版本为精简版，核心命令如下：
+- `login`
+- `logout`
+- `workspace-list`
+- `workspace-usage`
+- `project-list`
+- `project-usage`
+- `user-jobs`
+- `project-user-usage`
+- `train-suggest`
 
 ## 安装依赖
 
 ```bash
 pip install rich requests
+pip install -e .
 ```
+
+## 自动登录（.env）
+
+`qzcli login` 成功后会自动创建/覆盖 `.env` 并写入凭据。  
+当 cookie 过期时，命令会自动尝试读取 `.env` 并刷新 cookie。  
+支持以下字段（任一组即可）：
+
+```bash
+u=你的学工号
+p=你的密码
+
+# 或
+QZCLI_USERNAME=你的学工号
+QZCLI_PASSWORD=你的密码
+```
+
+`qzcli logout` 会删除 `.env` 并清理本地 cookie。
 
 ## 快速开始
 
 ```bash
-# 1. 登录（自动获取 cookie）
+# 1) 登录（自动获取并保存 cookie）
 qzcli login
 
-# 2. 更新资源缓存（首次使用必须执行，自动发现所有可访问的工作空间）
-qzcli res -u
+# 2) 查看工作空间占用率（不指定 -w 时默认统计全部 workspace）
+qzcli workspace-usage -w ws-xxx
+qzcli workspace-usage
 
-# 3. 查看空余节点
-qzcli avail
+# 可访问 workspace 列表
+qzcli workspace-list
 
-# 4. 查看运行中的任务
-qzcli ls -c -r
+# 3) 查看项目利用率（不指定 -p 时默认显示全部项目）
+qzcli project-usage -w ws-xxx -p project-xxx
+qzcli project-usage -w ws-xxx
+
+# 项目列表（默认全部 workspace）
+qzcli project-list
+qzcli project-list -w ws-xxx -n 20
+
+# 用户任务（默认自己；建议显式传 -u）
+qzcli user-jobs
+qzcli user-jobs -u 张三 -w ws-xxx
+
+# 项目用户占用 + 该项目全部 job
+qzcli project-user-usage -p project-xxx -w ws-xxx
+
+# 4) 获取多节点训练建议（默认 8 节点）
+qzcli train-suggest -n 8
 ```
 
-> **重要**: 
-> - 首次使用必须执行 `qzcli res -u`，会自动发现并缓存所有你有权限访问的工作空间
-> - 如果遇到 `未找到名称为 'xxx' 的工作空间` 错误，说明缓存需要更新，请重新执行 `qzcli res -u`
-> - 新加入的工作空间/项目需要重新执行 `qzcli res -u` 来更新缓存
+## 优先级约定
 
-## 推荐工作流
+- 低优先级：`1-4`
+- 普通优先级：`5`
+- 高优先级：`6-10`
 
-### 每日使用
+## 命令说明
 
-```bash
-# 登录并查看资源
-qzcli login && qzcli avail
-
-# 输出示例：
-# CI-情景智能
-#   计算组                          空节点    总节点 GPU类型     
-#   -----------------------------------------------------
-#   OV3蒸馏训练组                       4      xxx 某gpu2      
-#   openveo训练组                     1     xxx 某gpu2      
-#   ...
-# 分布式
-#   某gpu2-2号机房                      1    xxx 某gpu2      
-```
-
-### 提交任务前
+### 1) 登录
 
 ```bash
-# 找有 4 个空闲节点的计算组
-qzcli avail -n 4 -e
-
-# 如果需要考虑低优任务占用的节点（较慢，但更准确地反映潜在可用资源）
-qzcli avail --lp -n 4
-
-# 如果开启了 --lp (low priority) 模式，建议配合 -w 指定工作空间以加快速度
-qzcli avail --lp -w CI -n 4
-```
-
-### 查看任务
-
-```bash
-# 查看所有工作空间运行中的任务
-qzcli ls -c --all-ws -r
-
-# 查看指定工作空间
-qzcli ls -c -w CI -r
-```
-
-## 命令参考
-
-### 认证命令
-
-| 命令 | 说明 | 示例 |
-|------|------|------|
-| `login` | CAS 登录获取 cookie | `qzcli login` |
-| `cookie` | 手动设置 cookie | `qzcli cookie -f cookies.txt` |
-
-```bash
-# 交互式登录
 qzcli login
-
-# 带参数登录
-qzcli login -u 学工号 -p 密码
-
-# 查看当前 cookie
-qzcli cookie --show
-
-# 清除 cookie
-qzcli cookie --clear
+qzcli login -u 学工号 -p 密码 -w ws-xxx
 ```
 
-### 资源管理
-
-| 命令 | 别名 | 说明 |
-|------|------|------|
-| `resources` | `res`, `lsws` | 管理工作空间资源缓存 |
-| `avail` | `av` | 查询计算组空余节点 |
+### 2) 登出
 
 ```bash
-# 列出已缓存的工作空间
-qzcli res --list
-
-# 更新所有工作空间的资源缓存
-qzcli res -u
-
-# 更新指定工作空间
-qzcli res -w CI -u
-
-# 给工作空间设置别名
-qzcli res -w ws-xxx --name 我的空间
-
-# 查看空余节点（默认不包含低优任务统计，速度较快）
-qzcli avail
-
-# 查看空余节点（包含低优任务统计，即：空节点 + 低优任务占用的节点）
-qzcli avail --lp
-
-# 只查看 CI 工作空间
-qzcli avail -w CI
-
-# 显示空闲节点名称
-qzcli avail -w CI -v
-
-# 找满足 N 节点需求的计算组
-qzcli avail -n 4
-
-# 导出为脚本可用格式
-qzcli avail -n 4 -e
+qzcli logout
 ```
 
-### 任务列表
+### 3) 工作空间占用率
 
-| 命令 | 别名 | 说明 |
-|------|------|------|
-| `list` | `ls` | 列出任务 |
+输出核心指标：
+- 运行任务数
+- GPU 占用与利用率
+- 节点占用率
+- 高优任务 GPU 占用
 
 ```bash
-# Cookie 模式（从 API 获取）
-qzcli ls -c -w CI           # 指定工作空间
-qzcli ls -c --all-ws        # 所有工作空间
-qzcli ls -c -w CI -r        # 只看运行中
-qzcli ls -c -w CI -n 50     # 显示 50 条
-
-# 本地模式（从本地存储）
-qzcli ls                    # 默认列表
-qzcli ls -r                 # 运行中
-qzcli ls --no-refresh       # 不刷新状态
+qzcli workspace-usage -w ws-xxx
+qzcli workspace-usage -w ws-xxx --min-priority 6
 ```
 
-### 任务管理
+### 4) 项目利用率
 
-| 命令 | 说明 | 示例 |
-|------|------|------|
-| `status` | 查看任务详情 | `qzcli status job-xxx` |
-| `stop` | 停止任务 | `qzcli stop job-xxx` |
-| `watch` | 实时监控 | `qzcli watch -i 10` |
-| `track` | 追踪任务 | `qzcli track job-xxx` |
-
-### 工作空间视图
+输出核心指标：
+- 项目任务数（按优先级过滤）
+- 项目 GPU 占用
+- 工作空间 GPU 占用
+- 项目占比（项目 GPU / 工作空间 GPU）
+- 项目任务明细
+- 每个 job 的实时利用率：`GPU / CPU / MEM`
 
 ```bash
-# 查看工作空间内运行任务（含 GPU 使用率）
-qzcli ws
-
-# 查看所有项目
-qzcli ws -a
-
-# 过滤指定项目
-qzcli ws -p "长视频"
+qzcli project-usage -w ws-xxx -p project-xxx
+qzcli project-usage -w ws-xxx -p dis
+qzcli project-usage -w ws-xxx -p project-xxx --min-priority 6 -n 20
 ```
 
-## 输出示例
+### 5) 用户任务
 
-### qzcli avail -v
-
-```
-CI-情景智能
-  计算组                          空节点    总节点 GPU类型     
-  -----------------------------------------------------
-  OV3蒸馏训练组                       4      8 某gpu2      
-    空闲: qb-prod-gpu1006, qb-prod-gpu1029, qb-prod-gpu1034, qb-prod-gpu1064
-  openveo训练组                     1     79 某gpu2      
-    空闲: qb-prod-gpu2000
-```
-
-### qzcli ls -c -w CI -r
-
-```
-工作空间: CI-情景智能
-
-[1] ● 运行中 | 44分钟前 | 44分36秒
-    eval-OpenVeo3-I2VA-A14B-1227-8s...
-    8×某gpu2 | 4节点 | GPU资源组
-    https://qz.sii.edu.cn/jobs/distributedTrainingDetail/job-xxx
-
-[2] ● 运行中 | 58分钟前 | 56分47秒
-    sglang-eval-A14B-360p-wsd-105000...
-    8×某gpu2 | 2节点 | GPU资源组
-```
-
-## 配置文件
-
-配置存储在 `~/.qzcli/` 目录：
-
-| 文件 | 说明 |
-|------|------|
-| `config.json` | API 认证信息 |
-| `jobs.json` | 本地任务历史 |
-| `.cookie` | Cookie（login 命令自动管理） |
-| `resources.json` | 资源缓存（工作空间、计算组等） |
-
-## 环境变量
+输出：
+- 指定用户（默认自己）的 job 列表
+- 每个 job 的 `GPU / CPU / MEM` 利用率
 
 ```bash
-export QZCLI_USERNAME="your_username"
-export QZCLI_PASSWORD="your_password"
-export QZCLI_API_URL="https://qz.sii.edu.cn"
+qzcli user-jobs
+qzcli user-jobs -u 张三
+qzcli user-jobs -u 张三 -w ws-xxx -n 20
 ```
 
-## 使用建议
+### 6) 项目用户占用
 
-- **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
-- **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
-- **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
-- **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率
+输出：
+- 项目内按用户的 GPU 占用汇总
+- 该项目全部 job 列表
+- 每个 job 的 `GPU / CPU / MEM` 利用率
+
+```bash
+qzcli project-user-usage -p project-xxx -w ws-xxx
+qzcli project-user-usage -p dis --min-priority 1
+```
+
+### 7) 多节点训练建议
+
+排序依据：
+- 是否满足目标节点数
+- 可用节点数（空闲节点 + 可回收低优节点）
+- 高优排队压力
+
+```bash
+# 全工作空间推荐
+qzcli train-suggest -n 8
+
+# 指定工作空间
+qzcli train-suggest -w ws-xxx -n 8
+
+# 不计低优可回收
+qzcli train-suggest -n 8 --no-low-priority
+```
+
+## 帮助
+
+```bash
+qzcli --help
+qzcli workspace-usage --help
+qzcli project-usage --help
+qzcli user-jobs --help
+qzcli project-user-usage --help
+qzcli train-suggest --help
+```

@@ -1,3 +1,4 @@
 cookies.txt
 */__pycache__/*
 qzcli.egg-info/*
+.env

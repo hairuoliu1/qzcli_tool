@@ -291,19 +291,53 @@ def find_resource_by_name(
     
     resources = ws_resources.get(resource_type, {})
     
-    # 精确匹配优先
+    # 精确匹配优先（名称/别名）
     for res_id, res_data in resources.items():
         res_name = res_data.get("name", "")
-        if res_name == name:
+        res_alias = res_data.get("alias", "")
+        if res_name == name or res_alias == name:
             return res_data
     
-    # 模糊匹配
+    # 模糊匹配（名称/别名）
     for res_id, res_data in resources.items():
         res_name = res_data.get("name", "")
-        if name.lower() in res_name.lower():
+        res_alias = res_data.get("alias", "")
+        if name.lower() in res_name.lower() or (res_alias and name.lower() in res_alias.lower()):
             return res_data
     
     return None
+
+
+def set_project_alias(workspace_id: str, project_id: str, alias: str) -> bool:
+    """
+    设置项目别名
+    
+    Args:
+        workspace_id: 工作空间 ID
+        project_id: 项目 ID
+        alias: 项目别名
+        
+    Returns:
+        是否成功
+    """
+    all_resources = load_all_resources()
+    ws_data = all_resources.get(workspace_id)
+    if not ws_data:
+        return False
+
+    projects = ws_data.get("projects", {})
+    project = projects.get(project_id)
+    if not project:
+        return False
+
+    project["alias"] = alias
+    projects[project_id] = project
+    ws_data["projects"] = projects
+
+    ensure_config_dir()
+    with open(RESOURCES_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_resources, f, indent=2, ensure_ascii=False)
+    return True
 
 
 def list_cached_workspaces() -> List[Dict[str, Any]]:
