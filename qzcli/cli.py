@@ -4,6 +4,7 @@
 import argparse
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,6 +20,12 @@ from .config import (
     save_cookie,
 )
 from .display import format_duration, get_display
+
+try:
+    from pypinyin import Style, lazy_pinyin
+except Exception:  # pragma: no cover - optional dependency fallback
+    Style = None
+    lazy_pinyin = None
 
 
 def _format_percent(numerator: int, denominator: int) -> str:
@@ -615,21 +622,49 @@ def cmd_project_list(args):
 def _task_user_values(task: Dict[str, Any]) -> List[str]:
     user = task.get("user") or {}
     values: List[str] = []
-    for key in ("name", "id", "username", "account", "email"):
+    for key in ("name", "username"):
         v = user.get(key)
-        if v is not None:
-            values.append(str(v))
-    return [v for v in values if v]
+        if v is None:
+            continue
+        sv = str(v).strip()
+        if sv:
+            values.append(sv)
+    # de-duplicate while preserving order
+    return list(dict.fromkeys(values))
+
+
+def _normalize_user_query(value: str) -> str:
+    return "".join(ch for ch in value.strip().lower() if ch not in " \t_-")
+
+
+def _is_ascii_query(value: str) -> bool:
+    return bool(value) and all(ord(ch) < 128 for ch in value)
+
+
+@lru_cache(maxsize=4096)
+def _username_pinyin_key(username: str) -> str:
+    """Convert a Chinese username to compact pinyin key (e.g. 张三 -> zhangsan)."""
+    if not username or not lazy_pinyin:
+        return ""
+    try:
+        py = "".join(lazy_pinyin(username, style=Style.NORMAL, errors="ignore"))
+    except Exception:
+        return ""
+    return _normalize_user_query(py)
 
 
 def _task_match_user(task: Dict[str, Any], user_query: str) -> bool:
-    query = user_query.strip().lower()
+    query = _normalize_user_query(user_query)
     if not query:
         return False
     values = _task_user_values(task)
     for v in values:
-        lv = v.lower()
-        if query == lv or query in lv:
+        username_key = _normalize_user_query(v)
+        if not username_key:
+            continue
+        if query == username_key:
+            return True
+        if query == _username_pinyin_key(v):
             return True
     return False
 
@@ -647,6 +682,10 @@ def cmd_user_jobs(args):
     user_query = args.user or _get_env_credentials()[0]
     if not user_query:
         display.print_error("未指定用户，且 .env 中没有 u/QZCLI_USERNAME")
+        return 1
+    normalized_query = _normalize_user_query(user_query)
+    if _is_ascii_query(normalized_query) and not lazy_pinyin:
+        display.print_error("英文查询需安装 pypinyin：pip install pypinyin")
         return 1
 
     try:
@@ -1021,7 +1060,7 @@ def main():
         help="查看某个用户的任务（默认 .env 中的当前用户）",
     )
     user_jobs_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（不填则遍历全部）")
-    user_jobs_parser.add_argument("--user", "-u", help="用户标识（姓名/账号/ID；不填默认自己）")
+    user_jobs_parser.add_argument("--user", "-u", help="用户名（匹配 name/username，支持拼音；不填默认自己）")
     user_jobs_parser.add_argument("--min-priority", type=int, default=1, help="最小优先级过滤（默认 1）")
     user_jobs_parser.add_argument("--limit", "-n", type=int, default=50, help="每个 workspace 最多显示多少任务（<=0 表示全部）")
 

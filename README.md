@@ -14,9 +14,11 @@
 ## 安装依赖
 
 ```bash
-pip install rich requests
+pip install -r requirements.txt
 pip install -e .
 ```
+
+若希望 `user-jobs -u zhangsan` 匹配中文用户名（如 `张三`），请确保安装了 `pypinyin`（已在 `requirements.txt` 中声明）。
 
 ## 自动登录（.env）
 
@@ -59,6 +61,7 @@ qzcli project-list -w ws-xxx -n 20
 # 用户任务（默认自己；建议显式传 -u）
 qzcli user-jobs
 qzcli user-jobs -u 张三 -w ws-xxx
+qzcli user-jobs -u zhangsan -w ws-xxx
 
 # 项目用户占用 + 该项目全部 job
 qzcli project-user-usage -p project-xxx -w ws-xxx
@@ -126,6 +129,7 @@ qzcli project-usage -w ws-xxx -p project-xxx --min-priority 6 -n 20
 ```bash
 qzcli user-jobs
 qzcli user-jobs -u 张三
+qzcli user-jobs -u zhangsan
 qzcli user-jobs -u 张三 -w ws-xxx -n 20
 ```
 
