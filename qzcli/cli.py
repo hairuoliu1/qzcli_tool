@@ -2,11 +2,13 @@
 """qzcli - 启智平台核心 CLI。"""
 
 import argparse
+import heapq
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import __version__
 from .api import QzAPIError, get_api
@@ -653,20 +655,22 @@ def _username_pinyin_key(username: str) -> str:
     return _normalize_user_query(py)
 
 
-def _task_match_user(task: Dict[str, Any], user_query: str) -> bool:
-    query = _normalize_user_query(user_query)
-    if not query:
-        return False
-    values = _task_user_values(task)
-    for v in values:
+def _task_user_match_keys(task: Dict[str, Any]) -> Set[str]:
+    keys: Set[str] = set()
+    for v in _task_user_values(task):
         username_key = _normalize_user_query(v)
-        if not username_key:
-            continue
-        if query == username_key:
-            return True
-        if query == _username_pinyin_key(v):
-            return True
-    return False
+        if username_key:
+            keys.add(username_key)
+        py_key = _username_pinyin_key(v)
+        if py_key:
+            keys.add(py_key)
+    return keys
+
+
+def _top_tasks_by_gpu(tasks: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0 or limit >= len(tasks):
+        return sorted(tasks, key=lambda x: (x.get("gpu") or {}).get("total", 0), reverse=True)
+    return heapq.nlargest(limit, tasks, key=lambda x: (x.get("gpu") or {}).get("total", 0))
 
 
 def cmd_user_jobs(args):
@@ -701,31 +705,56 @@ def cmd_user_jobs(args):
     total_found = 0
     display.print(f"\n[bold]用户任务[/bold] [dim]{user_query}[/dim]\n")
 
-    for workspace_id, ws_name in workspace_list:
+    query_keys = {normalized_query}
+    if lazy_pinyin:
+        q_py = _username_pinyin_key(user_query)
+        if q_py:
+            query_keys.add(q_py)
+
+    def _fetch_and_filter(ws_item: Tuple[str, str]) -> Tuple[str, str, List[Dict[str, Any]], Optional[Exception]]:
+        workspace_id, ws_name = ws_item
         try:
             tasks = _fetch_all_tasks(api, workspace_id, cookie, page_size=200)
         except QzAPIError as e:
-            display.print_warning(f"[{ws_name or workspace_id}] 查询失败: {e}")
-            continue
+            return workspace_id, ws_name, [], e
 
-        matched = [
-            t
-            for t in tasks
-            if _task_match_user(t, user_query) and (t.get("priority", 0) or 0) >= min_priority
-        ]
+        matched = []
+        for t in tasks:
+            if (t.get("priority", 0) or 0) < min_priority:
+                continue
+            if _task_user_match_keys(t) & query_keys:
+                matched.append(t)
+        return workspace_id, ws_name, matched, None
+
+    workers = min(8, max(1, len(workspace_list)))
+    results: Dict[str, Tuple[str, List[Dict[str, Any]], Optional[Exception]]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_fetch_and_filter, ws_item): ws_item[0] for ws_item in workspace_list}
+        for future in as_completed(futures):
+            workspace_id, ws_name, matched, err = future.result()
+            results[workspace_id] = (ws_name, matched, err)
+
+    for workspace_id, ws_name in workspace_list:
+        cached = results.get(workspace_id)
+        if not cached:
+            continue
+        resolved_ws_name, matched, err = cached
+        if err:
+            display.print_warning(f"[{resolved_ws_name or workspace_id}] 查询失败: {err}")
+            continue
         if not matched:
             continue
 
         total_found += len(matched)
         gpu_sum = sum((t.get("gpu") or {}).get("total", 0) for t in matched)
+        limit = args.limit if args.limit and args.limit > 0 else len(matched)
+        top_tasks = _top_tasks_by_gpu(matched, limit)
 
-        display.print(f"[bold]{ws_name or workspace_id}[/bold]")
+        display.print(f"[bold]{resolved_ws_name or workspace_id}[/bold]")
         display.print(f"[dim]{workspace_id}[/dim]")
         display.print(f"{len(matched)} 个任务 | {gpu_sum} GPU\n")
 
-        matched.sort(key=lambda x: (x.get("gpu") or {}).get("total", 0), reverse=True)
-        limit = args.limit if args.limit and args.limit > 0 else len(matched)
-        for idx, task in enumerate(matched[:limit], 1):
+        for idx, task in enumerate(top_tasks, 1):
             job_id = task.get("id", "")
             name = task.get("name", "")
             priority = task.get("priority", 0)
