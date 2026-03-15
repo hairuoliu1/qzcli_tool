@@ -362,7 +362,7 @@ for ckpt in "${CHECKPOINTS[@]}"; do
       --name "eval-$(basename $ckpt)-step${step}" \
       --command "bash /path/to/eval.sh --ckpt $ckpt --step $step" \
       --workspace "分布式训练" \
-      --compute-group "H200-3号机房-2" \
+      --compute-group "xxx-3号机房-2" \
       --instances 4
     sleep 3
   done
