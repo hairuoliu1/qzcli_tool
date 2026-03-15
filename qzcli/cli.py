@@ -1948,7 +1948,7 @@ def cmd_create(args):
         "project_id": project_id,
         "workspace_id": workspace_id,
         "framework": args.framework,
-        "command": args.command,
+        "command": args.cmd_str,
         "task_priority": args.priority,
         "auto_fault_tolerance": False,
         "framework_config": [{
@@ -1978,7 +1978,7 @@ def cmd_create(args):
     display.print(f"  实例数: {args.instances}")
     display.print(f"  共享内存: {args.shm} GiB")
     display.print(f"  优先级: {args.priority}")
-    display.print(f"  命令: {args.command[:120]}{'...' if len(args.command) > 120 else ''}")
+    display.print(f"  命令: {args.cmd_str[:120]}{'...' if len(args.cmd_str) > 120 else ''}")
     display.print("")
 
     # --- Submit ---
@@ -2013,7 +2013,7 @@ def cmd_create(args):
             workspace_id=resp_ws_id,
             project_id=project_id,
             source="qzcli create",
-            command=args.command,
+            command=args.cmd_str,
             url=job_url,
             instance_count=args.instances,
             priority_level=str(args.priority),
@@ -2116,7 +2116,7 @@ def cmd_batch(args):
         # Build argparse-like namespace for cmd_create
         create_args = argparse.Namespace(
             name=job_name,
-            command=command,
+            cmd_str=command,
             workspace=defaults.get("workspace", ""),
             project=defaults.get("project", ""),
             compute_group=defaults.get("compute_group", ""),
@@ -2353,7 +2353,7 @@ def main():
     # create 命令 - 创建任务
     create_parser = subparsers.add_parser("create", aliases=["create-job"], help="创建并提交任务到启智平台")
     create_parser.add_argument("--name", "-n", required=True, help="任务名称")
-    create_parser.add_argument("--command", "-c", required=True, help="执行命令")
+    create_parser.add_argument("--command", "-c", dest="cmd_str", required=True, help="执行命令")
     create_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli res 缓存解析）")
     create_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
     create_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
