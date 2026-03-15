@@ -149,7 +149,7 @@ def cmd_init(args):
         username = input("请输入启智平台用户名: ").strip()
     if not password:
         import getpass
-        password = getpass.getpass("请输入密码: ").strip()
+        password = getpass.getpass("请输入密码: ")
     
     if not username or not password:
         display.print_error("用户名和密码不能为空")
@@ -2186,6 +2186,12 @@ def cmd_login(args):
     
     # 获取密码
     password = args.password
+    if getattr(args, 'password_stdin', False):
+        try:
+            password = sys.stdin.readline().rstrip('\n')
+        except (EOFError, KeyboardInterrupt):
+            display.print_error("未从 stdin 读取到密码")
+            return 1
     if not password:
         try:
             password = getpass.getpass("密码: ")
@@ -2306,7 +2312,8 @@ def main():
     # login 命令
     login_parser = subparsers.add_parser("login", help="通过 CAS 统一认证登录获取 cookie")
     login_parser.add_argument("--username", "-u", help="学工号")
-    login_parser.add_argument("--password", "-p", help="密码")
+    login_parser.add_argument("--password", "-p", help="密码（含特殊字符时建议用单引号或 --password-stdin）")
+    login_parser.add_argument("--password-stdin", action="store_true", help="从 stdin 读取密码（适合脚本: echo 'pass' | qzcli login -u user --password-stdin）")
     login_parser.add_argument("--workspace", "-w", help="默认工作空间 ID")
     
     # workspace 命令
