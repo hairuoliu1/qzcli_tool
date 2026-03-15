@@ -991,6 +991,167 @@ def qz_list_tracked_jobs(limit: int = 20, running_only: bool = False, refresh: b
     )
 
 
+def _resolve_resource_id_mcp(
+    workspace_id: str, resource_type: str, value: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Resolve a resource name or ID to (id, display_name) for MCP tools."""
+    if not value:
+        return None, None
+    prefixes = {"projects": "project-", "compute_groups": "lcg-"}
+    prefix = prefixes.get(resource_type, "")
+    if prefix and value.startswith(prefix):
+        return value, value
+    if resource_type == "specs" and len(value) > 20:
+        return value, value
+    found = find_resource_by_name(workspace_id, resource_type, value)
+    if found:
+        return found["id"], found.get("name", value)
+    return None, None
+
+
+def _auto_select_resource_mcp(
+    workspace_id: str, resource_type: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Auto-select the first resource of a given type from cache."""
+    ws_resources = get_workspace_resources(workspace_id)
+    if not ws_resources:
+        return None, None
+    resources = ws_resources.get(resource_type, {})
+    if not resources:
+        return None, None
+    first = next(iter(resources.values()))
+    return first["id"], first.get("name", first["id"])
+
+
+@server.tool(
+    description=(
+        "创建并提交任务到启智平台。workspace/project/compute_group 支持名称或 ID"
+        "（名称从 qz_refresh_resources 缓存解析）。"
+        "省略 project/spec 时自动从缓存选取第一个。"
+    )
+)
+def qz_create_job(
+    name: str,
+    command: str,
+    workspace: str,
+    project: str = "",
+    compute_group: str = "",
+    spec: str = "",
+    image: str = "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+    image_type: str = "SOURCE_PRIVATE",
+    instances: int = 1,
+    shm: int = 1200,
+    priority: int = 10,
+    framework: str = "pytorch",
+    track: bool = True,
+) -> dict[str, Any]:
+    api = get_api()
+    store = get_store()
+    warnings: list[str] = []
+
+    # Resolve workspace
+    if workspace.startswith("ws-"):
+        workspace_id = workspace
+    else:
+        workspace_id = find_workspace_by_name(workspace)
+        if not workspace_id:
+            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+
+    # Resolve project
+    if project:
+        if project.startswith("project-"):
+            project_id = project
+        else:
+            project_id, _ = _resolve_resource_id_mcp(workspace_id, "projects", project)
+            if not project_id:
+                raise RuntimeError(f"未找到项目 '{project}'。")
+    else:
+        project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
+        if not project_id:
+            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
+        warnings.append(f"自动选择项目: {proj_name} ({project_id})")
+
+    # Resolve compute group
+    if compute_group:
+        if compute_group.startswith("lcg-"):
+            compute_group_id = compute_group
+        else:
+            compute_group_id, _ = _resolve_resource_id_mcp(workspace_id, "compute_groups", compute_group)
+            if not compute_group_id:
+                raise RuntimeError(f"未找到计算组 '{compute_group}'。")
+    else:
+        compute_group_id, cg_name = _auto_select_resource_mcp(workspace_id, "compute_groups")
+        if not compute_group_id:
+            raise RuntimeError("未指定计算组且缓存中无可用计算组。请指定 compute_group 或先调用 qz_refresh_resources。")
+        warnings.append(f"自动选择计算组: {cg_name} ({compute_group_id})")
+
+    # Resolve spec
+    if spec:
+        spec_id = spec
+    else:
+        spec_id, spec_name = _auto_select_resource_mcp(workspace_id, "specs")
+        if not spec_id:
+            raise RuntimeError("未指定规格且缓存中无可用规格。请指定 spec 或先调用 qz_refresh_resources。")
+        warnings.append(f"自动选择规格: {spec_name} ({spec_id})")
+
+    payload = {
+        "name": name,
+        "logic_compute_group_id": compute_group_id,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        "framework": framework,
+        "command": command,
+        "task_priority": priority,
+        "auto_fault_tolerance": False,
+        "framework_config": [
+            {
+                "spec_id": spec_id,
+                "image": image,
+                "image_type": image_type,
+                "instance_count": instances,
+                "shm_gi": shm,
+            }
+        ],
+    }
+
+    result = api.create_job(payload)
+    job_id = result.get("job_id", "")
+    resp_ws_id = result.get("workspace_id", workspace_id)
+
+    if not job_id:
+        raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
+
+    job_url = f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
+
+    if track:
+        job = JobRecord(
+            job_id=job_id,
+            name=name,
+            status="job_pending",
+            workspace_id=resp_ws_id,
+            project_id=project_id,
+            source="qz_create_job",
+            command=command,
+            url=job_url,
+            instance_count=instances,
+            priority_level=str(priority),
+        )
+        store.add(job)
+
+    return _result(
+        {
+            "job_id": job_id,
+            "workspace_id": resp_ws_id,
+            "url": job_url,
+            "name": name,
+            "tracked": track,
+            "payload": payload,
+        },
+        message="任务创建成功。",
+        warnings=warnings,
+    )
+
+
 def main() -> None:
     server.run(transport="stdio")
 

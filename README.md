@@ -29,6 +29,9 @@ qzcli login -u 用户名 -p 密码 && qzcli avail
 
 ```bash
 pip install rich requests mcp
+
+cd qzcli_tool
+pip install -e .
 ```
 
 ## 快速开始
@@ -251,6 +254,121 @@ qzcli ls -r                 # 运行中
 qzcli ls --no-refresh       # 不刷新状态
 ```
 
+### 创建任务
+
+| 命令 | 别名 | 说明 |
+|------|------|------|
+| `create` | `create-job` | 创建并提交任务 |
+| `batch` | | 从 JSON 配置文件批量提交任务 |
+
+```bash
+# 使用名称（从 qzcli res 缓存解析）
+qzcli create \
+  --name "my-training-job" \
+  --command "bash /path/to/script.sh" \
+  --workspace "分布式训练" \
+  --project "扩散" \
+  --compute-group "3号机房-2" \
+  --instances 4 \
+  --priority 10
+
+# 使用 ID
+qzcli create \
+  --name "my-training-job" \
+  --command "bash /path/to/script.sh" \
+  --workspace ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6 \
+  --project project-7e0957fb-eaa7-4ded-8dca-dd508b2ae01d \
+  --compute-group lcg-a91ad10b-415d-4abd-8170-828a2feae5d2 \
+  --spec b618f5cb-c119-4422-937e-f39131853076 \
+  --instances 4
+
+# 预览 payload 不提交
+qzcli create --name test --command "echo hi" --workspace "分布式训练" --dry-run
+
+# JSON 输出（供脚本集成）
+qzcli create --name test --command "echo hi" --workspace "分布式训练" --json
+```
+
+**参数说明:**
+
+| 参数 | 短选项 | 默认值 | 说明 |
+|------|--------|--------|------|
+| `--name` | `-n` | (必填) | 任务名称 |
+| `--command` | `-c` | (必填) | 执行命令 |
+| `--workspace` | `-w` | | 工作空间 ID 或名称 |
+| `--project` | `-p` | (自动选择) | 项目 ID 或名称 |
+| `--compute-group` | `-g` | (自动选择) | 计算组 ID 或名称 |
+| `--spec` | `-s` | (自动选择) | 资源规格 ID |
+| `--image` | `-i` | `dhyu-wan-torch29:0.4` | Docker 镜像 |
+| `--instances` | | 1 | 实例数量 |
+| `--shm` | | 1200 | 共享内存 GiB |
+| `--priority` | | 10 | 优先级 1-10 |
+| `--framework` | | pytorch | 框架类型 |
+| `--no-track` | | | 不自动追踪 |
+| `--dry-run` | | | 只预览不提交 |
+| `--json` | | | JSON 输出 |
+
+> **提示**: `--project`、`--compute-group`、`--spec` 省略时会自动从 `qzcli res` 缓存中选取第一个。首次使用前请先运行 `qzcli res -u` 发现资源。
+
+### 批量提交任务
+
+```bash
+# 从 JSON 配置批量提交
+qzcli batch batch_eval.json --delay 3
+
+# 预览所有任务
+qzcli batch batch_eval.json --dry-run
+
+# 遇到错误继续提交
+qzcli batch batch_eval.json --continue-on-error
+```
+
+**批量配置文件格式 (JSON):**
+
+```json
+{
+  "defaults": {
+    "workspace": "ws-9dcc0e1f-80a4-4af2-bc2f-0e352e7b17e6",
+    "project": "project-7e0957fb-eaa7-4ded-8dca-dd508b2ae01d",
+    "compute_group": "lcg-a91ad10b-415d-4abd-8170-828a2feae5d2",
+    "spec": "b618f5cb-c119-4422-937e-f39131853076",
+    "image": "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4",
+    "instances": 4,
+    "shm": 1200,
+    "priority": 10
+  },
+  "matrix": {
+    "checkpoint": ["/path/to/ckpt1", "/path/to/ckpt2"],
+    "eval_mode": ["mybench_universe", "video_universe"],
+    "step": [105000, 200000]
+  },
+  "name_template": "eval-{checkpoint_basename}-{eval_mode}-step{step}",
+  "command_template": "bash /path/to/eval.sh --checkpoint_dir {checkpoint} --eval_mode {eval_mode} --specific_steps {step}"
+}
+```
+
+`matrix` 中的所有维度会做笛卡尔积，上面的例子会生成 2 x 2 x 2 = 8 个任务。模板中可用 `{key}` 引用 matrix 变量，路径类变量还可用 `{key_basename}` 获取文件名。
+
+**在 shell 脚本中循环提交（替代旧的 curl 方式）:**
+
+```bash
+#!/bin/bash
+CHECKPOINTS=("/path/to/ckpt1" "/path/to/ckpt2")
+STEPS=(105000 200000)
+
+for ckpt in "${CHECKPOINTS[@]}"; do
+  for step in "${STEPS[@]}"; do
+    qzcli create \
+      --name "eval-$(basename $ckpt)-step${step}" \
+      --command "bash /path/to/eval.sh --ckpt $ckpt --step $step" \
+      --workspace "分布式训练" \
+      --compute-group "H200-3号机房-2" \
+      --instances 4
+    sleep 3
+  done
+done
+```
+
 ### 任务管理
 
 | 命令 | 说明 | 示例 |
@@ -325,5 +443,7 @@ export QZCLI_API_URL="https://qz.sii.edu.cn"
 
 - **日常使用**: `qzcli login && qzcli avail` 一键登录并查看资源
 - **提交前**: `qzcli avail -n 4 -e` 找合适的计算组并导出配置
+- **提交任务**: `qzcli create -n "job" -c "bash run.sh" -w "分布式训练" --instances 4`
+- **批量提交**: `qzcli batch config.json` 从配置文件批量提交
 - **监控任务**: `qzcli ls -c --all-ws -r` 查看所有工作空间运行中的任务
 - **详细信息**: `qzcli ws` 查看 GPU/CPU/内存使用率

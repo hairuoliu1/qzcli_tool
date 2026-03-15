@@ -1767,7 +1767,7 @@ def cmd_workspace(args):
             store = get_store()
             for task in tasks:
                 job_id = task.get("id", "")
-                if job_id and not store.get_job(job_id):
+                if job_id and not store.get(job_id):
                     # 创建简化的 JobRecord
                     from .store import JobRecord
                     job = JobRecord(
@@ -1778,7 +1778,7 @@ def cmd_workspace(args):
                         workspace_id=workspace_id,
                         project_name=task.get("project", {}).get("name", ""),
                     )
-                    store.add_job(job)
+                    store.add(job)
                     synced_count += 1
             if synced_count > 0:
                 display.print_success(f"已同步 {synced_count} 个新任务到本地")
@@ -1828,6 +1828,340 @@ def cmd_workspace(args):
         else:
             display.print_error(f"获取失败: {e}")
         return 1
+
+
+def _resolve_resource_id(workspace_id, resource_type, value):
+    """Resolve a resource name or ID to its ID. Returns (resolved_id, display_name)."""
+    if not value:
+        return None, None
+    prefixes = {"projects": "project-", "compute_groups": "lcg-", "specs": ""}
+    prefix = prefixes.get(resource_type, "")
+    if prefix and value.startswith(prefix):
+        return value, value
+    if resource_type == "specs" and len(value) > 20:
+        return value, value
+    found = find_resource_by_name(workspace_id, resource_type, value)
+    if found:
+        return found["id"], found.get("name", value)
+    return None, None
+
+
+def _auto_select_resource(workspace_id, resource_type):
+    """Auto-select the first resource of a given type from cache."""
+    ws_resources = get_workspace_resources(workspace_id)
+    if not ws_resources:
+        return None, None
+    resources = ws_resources.get(resource_type, {})
+    if not resources:
+        return None, None
+    first = next(iter(resources.values()))
+    return first["id"], first.get("name", first["id"])
+
+
+def cmd_create(args):
+    """创建任务"""
+    display = get_display()
+    api = get_api()
+    store = get_store()
+
+    # --- Resolve workspace ---
+    workspace_id = None
+    ws_display = ""
+    if args.workspace:
+        if args.workspace.startswith("ws-"):
+            workspace_id = args.workspace
+        else:
+            workspace_id = find_workspace_by_name(args.workspace)
+            if not workspace_id:
+                display.print_error(f"未找到名称为 '{args.workspace}' 的工作空间")
+                display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+                return 1
+        ws_resources = get_workspace_resources(workspace_id)
+        ws_display = (ws_resources or {}).get("name", workspace_id)
+    else:
+        display.print_error("请指定工作空间: --workspace <名称或ID>")
+        display.print("[dim]使用 qzcli res --list 查看已缓存的工作空间[/dim]")
+        return 1
+
+    # --- Resolve project ---
+    project_id = None
+    proj_display = ""
+    if args.project:
+        if args.project.startswith("project-"):
+            project_id = args.project
+            proj_display = project_id
+        else:
+            project_id, proj_display = _resolve_resource_id(workspace_id, "projects", args.project)
+            if not project_id:
+                display.print_error(f"未找到项目 '{args.project}'")
+                display.print("[dim]使用 qzcli res -w <workspace> 查看可用项目[/dim]")
+                return 1
+    else:
+        project_id, proj_display = _auto_select_resource(workspace_id, "projects")
+        if not project_id:
+            display.print_error("未指定项目且缓存中无可用项目")
+            display.print("[dim]使用 --project 指定，或先运行 qzcli res -u[/dim]")
+            return 1
+        display.print(f"[dim]自动选择项目: {proj_display} ({project_id})[/dim]")
+
+    # --- Resolve compute group ---
+    compute_group_id = None
+    cg_display = ""
+    if args.compute_group:
+        if args.compute_group.startswith("lcg-"):
+            compute_group_id = args.compute_group
+            cg_display = compute_group_id
+        else:
+            compute_group_id, cg_display = _resolve_resource_id(workspace_id, "compute_groups", args.compute_group)
+            if not compute_group_id:
+                display.print_error(f"未找到计算组 '{args.compute_group}'")
+                display.print("[dim]使用 qzcli res -w <workspace> 查看可用计算组[/dim]")
+                return 1
+    else:
+        compute_group_id, cg_display = _auto_select_resource(workspace_id, "compute_groups")
+        if not compute_group_id:
+            display.print_error("未指定计算组且缓存中无可用计算组")
+            display.print("[dim]使用 --compute-group 指定，或先运行 qzcli res -u[/dim]")
+            return 1
+        display.print(f"[dim]自动选择计算组: {cg_display} ({compute_group_id})[/dim]")
+
+    # --- Resolve spec ---
+    spec_id = None
+    if args.spec:
+        spec_id = args.spec
+        if not (spec_id.count("-") >= 4 or len(spec_id) > 20):
+            resolved, _ = _resolve_resource_id(workspace_id, "specs", spec_id)
+            if resolved:
+                spec_id = resolved
+    else:
+        spec_id, spec_display = _auto_select_resource(workspace_id, "specs")
+        if not spec_id:
+            display.print_error("未指定资源规格且缓存中无可用规格")
+            display.print("[dim]使用 --spec 指定，或先运行 qzcli res -u[/dim]")
+            return 1
+        display.print(f"[dim]自动选择规格: {spec_display} ({spec_id})[/dim]")
+
+    # --- Build payload ---
+    payload = {
+        "name": args.name,
+        "logic_compute_group_id": compute_group_id,
+        "project_id": project_id,
+        "workspace_id": workspace_id,
+        "framework": args.framework,
+        "command": args.command,
+        "task_priority": args.priority,
+        "auto_fault_tolerance": False,
+        "framework_config": [{
+            "spec_id": spec_id,
+            "image": args.image,
+            "image_type": args.image_type,
+            "instance_count": args.instances,
+            "shm_gi": args.shm,
+        }],
+    }
+
+    # --- Dry run ---
+    if args.dry_run:
+        import json as json_mod
+        display.print("[bold]Dry run - 以下为将要提交的 payload:[/bold]\n")
+        print(json_mod.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    # --- Show summary ---
+    display.print(f"\n[bold]创建任务[/bold]")
+    display.print(f"  名称: {args.name}")
+    display.print(f"  工作空间: {ws_display} ({workspace_id})")
+    display.print(f"  项目: {proj_display} ({project_id})")
+    display.print(f"  计算组: {cg_display} ({compute_group_id})")
+    display.print(f"  规格: {spec_id}")
+    display.print(f"  镜像: {args.image}")
+    display.print(f"  实例数: {args.instances}")
+    display.print(f"  共享内存: {args.shm} GiB")
+    display.print(f"  优先级: {args.priority}")
+    display.print(f"  命令: {args.command[:120]}{'...' if len(args.command) > 120 else ''}")
+    display.print("")
+
+    # --- Submit ---
+    try:
+        result = api.create_job(payload)
+    except QzAPIError as e:
+        display.print_error(f"任务创建失败: {e}")
+        return 1
+
+    job_id = result.get("job_id", "")
+    resp_ws_id = result.get("workspace_id", workspace_id)
+
+    if not job_id:
+        display.print_error("任务创建失败: 响应中未包含 job_id")
+        if args.output_json:
+            import json as json_mod
+            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    job_url = f"https://qz.sii.edu.cn/jobs/distributedTrainingDetail/{job_id}?spaceId={resp_ws_id}"
+
+    display.print_success(f"任务创建成功!")
+    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
+    display.print(f"  链接: {job_url}")
+
+    # --- Auto track ---
+    if not args.no_track:
+        job = JobRecord(
+            job_id=job_id,
+            name=args.name,
+            status="job_pending",
+            workspace_id=resp_ws_id,
+            project_id=project_id,
+            source="qzcli create",
+            command=args.command,
+            url=job_url,
+            instance_count=args.instances,
+            priority_level=str(args.priority),
+        )
+        store.add(job)
+        display.print(f"  [dim]已自动追踪到本地[/dim]")
+
+    # --- JSON output ---
+    if args.output_json:
+        import json as json_mod
+        output = {
+            "job_id": job_id,
+            "workspace_id": resp_ws_id,
+            "url": job_url,
+            "name": args.name,
+        }
+        print(json_mod.dumps(output, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_batch(args):
+    """批量提交任务"""
+    import json as json_mod
+    import itertools
+
+    display = get_display()
+
+    config_path = Path(args.config)
+    if not config_path.exists():
+        display.print_error(f"配置文件不存在: {config_path}")
+        return 1
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json_mod.load(f)
+
+    defaults = config.get("defaults", {})
+    matrix = config.get("matrix", {})
+    name_template = config.get("name_template", "job-{_index}")
+    command_template = config.get("command_template", "")
+
+    if not command_template:
+        display.print_error("配置文件中缺少 command_template")
+        return 1
+
+    # Generate all combinations from matrix
+    keys = list(matrix.keys())
+    if not keys:
+        display.print_error("配置文件中 matrix 为空")
+        return 1
+
+    values = [matrix[k] if isinstance(matrix[k], list) else [matrix[k]] for k in keys]
+    combinations = list(itertools.product(*values))
+    total = len(combinations)
+
+    display.print(f"\n[bold]批量任务提交[/bold]")
+    display.print(f"  配置文件: {config_path}")
+    display.print(f"  矩阵维度: {' x '.join(f'{k}({len(matrix[k]) if isinstance(matrix[k], list) else 1})' for k in keys)}")
+    display.print(f"  总任务数: {total}")
+    display.print("")
+
+    if args.dry_run:
+        display.print("[bold]Dry run - 预览所有任务:[/bold]\n")
+
+    successful = 0
+    failed = 0
+    failed_tasks = []
+
+    for idx, combo in enumerate(combinations, 1):
+        # Build template variables
+        variables = dict(zip(keys, combo))
+        variables["_index"] = idx
+        for k, v in variables.items():
+            if isinstance(v, str) and "/" in v:
+                import os as os_mod
+                variables[f"{k}_basename"] = os_mod.path.basename(v)
+
+        try:
+            job_name = name_template.format(**variables)
+        except KeyError as e:
+            display.print_warning(f"任务 {idx}: name_template 变量缺失: {e}")
+            job_name = f"batch-job-{idx}"
+
+        try:
+            command = command_template.format(**variables)
+        except KeyError as e:
+            display.print_error(f"任务 {idx}: command_template 变量缺失: {e}")
+            failed += 1
+            failed_tasks.append(f"{idx}: template error {e}")
+            continue
+
+        if args.dry_run:
+            display.print(f"  [{idx}/{total}] {job_name}")
+            display.print(f"    命令: {command[:120]}{'...' if len(command) > 120 else ''}")
+            display.print("")
+            continue
+
+        display.print(f"[bold][{idx}/{total}][/bold] 提交: {job_name}")
+
+        # Build argparse-like namespace for cmd_create
+        create_args = argparse.Namespace(
+            name=job_name,
+            command=command,
+            workspace=defaults.get("workspace", ""),
+            project=defaults.get("project", ""),
+            compute_group=defaults.get("compute_group", ""),
+            spec=defaults.get("spec", ""),
+            image=defaults.get("image", "docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4"),
+            image_type=defaults.get("image_type", "SOURCE_PRIVATE"),
+            instances=defaults.get("instances", 1),
+            shm=defaults.get("shm", 1200),
+            priority=defaults.get("priority", 10),
+            framework=defaults.get("framework", "pytorch"),
+            no_track=False,
+            dry_run=False,
+            output_json=False,
+        )
+
+        ret = cmd_create(create_args)
+        if ret == 0:
+            successful += 1
+        else:
+            failed += 1
+            failed_tasks.append(f"{idx}: {job_name}")
+            if not args.continue_on_error:
+                display.print_error("任务提交失败，停止批量提交（使用 --continue-on-error 忽略错误）")
+                break
+
+        # Delay between submissions
+        if idx < total and not args.dry_run:
+            time.sleep(args.delay)
+
+    if args.dry_run:
+        display.print(f"[bold]预览完成，共 {total} 个任务[/bold]")
+        return 0
+
+    display.print(f"\n[bold]批量提交完成[/bold]")
+    display.print(f"  总任务数: {total}")
+    display.print(f"  成功: {successful}")
+    display.print(f"  失败: {failed}")
+
+    if failed_tasks:
+        display.print("\n[bold]失败的任务:[/bold]")
+        for task in failed_tasks:
+            display.print(f"  - {task}")
+        return 1
+
+    return 0
 
 
 def cmd_login(args):
@@ -2009,6 +2343,31 @@ def main():
     usage_parser.add_argument("--by-type", "-t", action="store_true", help="按任务类型统计（训练/建模/部署）")
     usage_parser.add_argument("--by-priority", "-r", action="store_true", help="按优先级统计")
     
+    # create 命令 - 创建任务
+    create_parser = subparsers.add_parser("create", aliases=["create-job"], help="创建并提交任务到启智平台")
+    create_parser.add_argument("--name", "-n", required=True, help="任务名称")
+    create_parser.add_argument("--command", "-c", required=True, help="执行命令")
+    create_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（从 qzcli res 缓存解析）")
+    create_parser.add_argument("--project", "-p", help="项目 ID 或名称（不指定则自动选择）")
+    create_parser.add_argument("--compute-group", "-g", dest="compute_group", help="计算组 ID 或名称")
+    create_parser.add_argument("--spec", "-s", help="资源规格 ID（不指定则自动选择）")
+    create_parser.add_argument("--image", "-i", default="docker.sii.shaipower.online/inspire-studio/dhyu-wan-torch29:0.4", help="Docker 镜像")
+    create_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
+    create_parser.add_argument("--instances", type=int, default=1, help="实例数量（默认 1）")
+    create_parser.add_argument("--shm", type=int, default=1200, help="共享内存 GiB（默认 1200）")
+    create_parser.add_argument("--priority", type=int, default=10, help="任务优先级 1-10（默认 10）")
+    create_parser.add_argument("--framework", default="pytorch", help="框架类型（默认 pytorch）")
+    create_parser.add_argument("--no-track", action="store_true", help="不自动追踪任务")
+    create_parser.add_argument("--dry-run", action="store_true", help="只显示 payload 不提交")
+    create_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
+    
+    # batch 命令 - 批量提交任务
+    batch_parser = subparsers.add_parser("batch", help="从 JSON 配置文件批量提交任务")
+    batch_parser.add_argument("config", help="批量配置文件路径（JSON 格式）")
+    batch_parser.add_argument("--dry-run", action="store_true", help="只预览不提交")
+    batch_parser.add_argument("--delay", type=float, default=3, help="任务间延迟秒数（默认 3）")
+    batch_parser.add_argument("--continue-on-error", action="store_true", help="遇到错误继续提交")
+    
     args = parser.parse_args()
     
     if not args.command:
@@ -2041,6 +2400,9 @@ def main():
         "avail": cmd_avail,
         "av": cmd_avail,
         "usage": cmd_usage,
+        "create": cmd_create,
+        "create-job": cmd_create,
+        "batch": cmd_batch,
     }
     
     cmd_func = commands.get(args.command)
