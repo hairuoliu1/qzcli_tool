@@ -2035,6 +2035,106 @@ def cmd_create(args):
     return 0
 
 
+def cmd_hpc(args):
+    """提交 HPC/CPU 任务"""
+    import json as json_mod
+    display = get_display()
+    api = get_api()
+    store = get_store()
+
+    cookie_data = get_cookie()
+    if not cookie_data:
+        display.print_error("未找到 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data.get("cookie", "")
+    if not cookie:
+        display.print_error("cookie 为空，请先运行: qzcli login")
+        return 1
+
+    # Resolve workspace
+    workspace_id = args.workspace
+    if not workspace_id.startswith("ws-"):
+        workspace_id = find_workspace_by_name(args.workspace)
+        if not workspace_id:
+            display.print_error(f"未找到名称为 '{args.workspace}' 的工作空间")
+            return 1
+
+    # Resolve project
+    project_id = args.project
+    if project_id and not project_id.startswith("project-"):
+        pid, _ = _resolve_resource_id(workspace_id, "projects", project_id)
+        if not pid:
+            display.print_error(f"未找到项目 '{args.project}'")
+            return 1
+        project_id = pid
+    if not project_id:
+        project_id, _ = _auto_select_resource(workspace_id, "projects")
+        if not project_id:
+            display.print_error("未指定项目且缓存中无可用项目，请用 --project 指定")
+            return 1
+
+    display.print(f"\n[bold]HPC 任务提交[/bold]")
+    display.print(f"  名称: {args.name}")
+    display.print(f"  计算组: {args.compute_group}")
+    display.print(f"  规格: {args.predef_quota_id} (cpu={args.cpu}, mem={args.mem_gi}GiB)")
+    display.print(f"  节点数: {args.instances}  cpus/task: {args.cpus_per_task}")
+    display.print(f"  命令: {args.entrypoint[:120]}{'...' if len(args.entrypoint) > 120 else ''}")
+    display.print("")
+
+    try:
+        result = api.create_hpc_job(
+            cookie=cookie,
+            job_name=args.name,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            logic_compute_group_id=args.compute_group,
+            entrypoint=args.entrypoint,
+            image=args.image,
+            predef_quota_id=args.predef_quota_id,
+            cpu=args.cpu,
+            mem_gi=args.mem_gi,
+            instances=args.instances,
+            cpus_per_task=args.cpus_per_task,
+            memory_per_cpu=args.memory_per_cpu,
+            image_type=args.image_type,
+        )
+    except QzAPIError as e:
+        display.print_error(f"任务创建失败: {e}")
+        return 1
+
+    job_id = result.get("job_id", "")
+    if not job_id:
+        display.print_error("任务创建失败: 响应中未包含 job_id")
+        if args.output_json:
+            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    job_url = f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}"
+    display.print_success(f"HPC 任务创建成功!")
+    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
+    display.print(f"  链接: {job_url}")
+
+    if not args.no_track:
+        job = JobRecord(
+            job_id=job_id,
+            name=args.name,
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source="qzcli hpc",
+            command=args.entrypoint,
+            url=job_url,
+            instance_count=args.instances,
+        )
+        store.add(job)
+        display.print("  [dim]已自动追踪到本地[/dim]")
+
+    if args.output_json:
+        print(json_mod.dumps({"job_id": job_id, "workspace_id": workspace_id, "url": job_url, "name": args.name}, ensure_ascii=False))
+
+    return 0
+
+
 def cmd_batch(args):
     """批量提交任务"""
     import json as json_mod
@@ -2369,6 +2469,23 @@ def main():
     create_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
     
     # batch 命令 - 批量提交任务
+    hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
+    hpc_parser.add_argument("--name", required=True, help="任务名称")
+    hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
+    hpc_parser.add_argument("--project", default="", help="项目名称或 ID（省略则自动选择）")
+    hpc_parser.add_argument("--compute-group", dest="compute_group", required=True, help="计算组 ID（lcg-...）")
+    hpc_parser.add_argument("--predef-quota-id", dest="predef_quota_id", required=True, help="预定义配额 ID")
+    hpc_parser.add_argument("--cpu", type=int, required=True, help="每节点 CPU 核心数")
+    hpc_parser.add_argument("--mem-gi", dest="mem_gi", type=int, required=True, help="每节点内存 GiB")
+    hpc_parser.add_argument("--instances", type=int, default=1, help="节点数（默认 1）")
+    hpc_parser.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=1, help="每任务 CPU 数（默认同 --cpu）")
+    hpc_parser.add_argument("--memory-per-cpu", dest="memory_per_cpu", default="5G", help="每 CPU 内存（默认 5G）")
+    hpc_parser.add_argument("--image", required=True, help="容器镜像地址")
+    hpc_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
+    hpc_parser.add_argument("--entrypoint", required=True, help="运行命令")
+    hpc_parser.add_argument("--no-track", action="store_true", help="不追踪任务")
+    hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="JSON 输出")
+
     batch_parser = subparsers.add_parser("batch", help="从 JSON 配置文件批量提交任务")
     batch_parser.add_argument("config", help="批量配置文件路径（JSON 格式）")
     batch_parser.add_argument("--dry-run", action="store_true", help="只预览不提交")
@@ -2409,6 +2526,7 @@ def main():
         "usage": cmd_usage,
         "create": cmd_create,
         "create-job": cmd_create,
+        "hpc": cmd_hpc,
         "batch": cmd_batch,
     }
     

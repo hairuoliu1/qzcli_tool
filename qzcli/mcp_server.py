@@ -1152,6 +1152,125 @@ def qz_create_job(
     )
 
 
+@server.tool()
+def qz_create_hpc_job(
+    name: str,
+    entrypoint: str,
+    workspace: str,
+    compute_group: str,
+    predef_quota_id: str,
+    cpu: int,
+    mem_gi: int,
+    image: str,
+    project: str = "",
+    instances: int = 1,
+    cpus_per_task: int = 1,
+    memory_per_cpu: str = "5G",
+    image_type: str = "SOURCE_PRIVATE",
+    track: bool = True,
+) -> dict[str, Any]:
+    """
+    提交 HPC/CPU 任务到启智平台（使用 cookie 认证，POST /api/v1/hpc_jobs）。
+
+    Args:
+        name: 任务名称
+        entrypoint: 运行命令（shell 命令字符串）
+        workspace: 工作空间名称或 ID（ws-...）
+        compute_group: 计算组 ID（lcg-...）
+        predef_quota_id: 预定义配额 ID（UUID）
+        cpu: 每节点 CPU 核心数
+        mem_gi: 每节点内存 GiB
+        image: 容器镜像地址
+        project: 项目名称或 ID（省略则自动选择）
+        instances: 节点数（默认 1）
+        cpus_per_task: 每任务 CPU 数（默认 1）
+        memory_per_cpu: 每 CPU 内存字符串（默认 5G）
+        image_type: 镜像类型（默认 SOURCE_PRIVATE）
+        track: 是否追踪任务（默认 True）
+    """
+    api = get_api()
+    store = get_store()
+    warnings: list[str] = []
+
+    cookie_data = get_cookie()
+    if not cookie_data:
+        raise RuntimeError("未找到 cookie，请先调用 qz_auth_login。")
+    cookie = cookie_data.get("cookie", "")
+    if not cookie:
+        raise RuntimeError("cookie 为空，请先调用 qz_auth_login。")
+
+    # Resolve workspace
+    if workspace.startswith("ws-"):
+        workspace_id = workspace
+    else:
+        workspace_id = find_workspace_by_name(workspace)
+        if not workspace_id:
+            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+
+    # Resolve project
+    if project:
+        if project.startswith("project-"):
+            project_id = project
+        else:
+            project_id, _ = _resolve_resource_id_mcp(workspace_id, "projects", project)
+            if not project_id:
+                raise RuntimeError(f"未找到项目 '{project}'。")
+    else:
+        project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
+        if not project_id:
+            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
+        warnings.append(f"自动选择项目: {proj_name} ({project_id})")
+
+    result = api.create_hpc_job(
+        cookie=cookie,
+        job_name=name,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        logic_compute_group_id=compute_group,
+        entrypoint=entrypoint,
+        image=image,
+        predef_quota_id=predef_quota_id,
+        cpu=cpu,
+        mem_gi=mem_gi,
+        instances=instances,
+        cpus_per_task=cpus_per_task,
+        memory_per_cpu=memory_per_cpu,
+        image_type=image_type,
+    )
+
+    job_id = result.get("job_id", "")
+    if not job_id:
+        raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
+
+    job_url = f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}"
+
+    if track:
+        job = JobRecord(
+            job_id=job_id,
+            name=name,
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source="qz_create_hpc_job",
+            command=entrypoint,
+            url=job_url,
+            instance_count=instances,
+        )
+        store.add(job)
+
+    return _result(
+        {
+            "job_id": job_id,
+            "workspace_id": workspace_id,
+            "url": job_url,
+            "name": name,
+            "tracked": track,
+        },
+        message="HPC 任务创建成功。",
+        warnings=warnings,
+    )
+
+
 def main() -> None:
     server.run(transport="stdio")
 
