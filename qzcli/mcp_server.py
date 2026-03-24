@@ -1152,6 +1152,218 @@ def qz_create_job(
     )
 
 
+@server.tool()
+def qz_create_hpc_job(
+    name: str,
+    entrypoint: str,
+    workspace: str,
+    compute_group: str,
+    predef_quota_id: str,
+    cpu: int,
+    mem_gi: int,
+    image: str,
+    project: str = "",
+    instances: int = 1,
+    cpus_per_task: int = 1,
+    memory_per_cpu: str = "5G",
+    image_type: str = "SOURCE_PRIVATE",
+    track: bool = True,
+) -> dict[str, Any]:
+    """
+    提交 HPC/CPU 任务到启智平台（使用 cookie 认证，POST /api/v1/hpc_jobs）。
+
+    Args:
+        name: 任务名称
+        entrypoint: 运行命令（shell 命令字符串）
+        workspace: 工作空间名称或 ID（ws-...）
+        compute_group: 计算组 ID（lcg-...）
+        predef_quota_id: 预定义配额 ID（UUID）
+        cpu: 每节点 CPU 核心数
+        mem_gi: 每节点内存 GiB
+        image: 容器镜像地址
+        project: 项目名称或 ID（省略则自动选择）
+        instances: 节点数（默认 1）
+        cpus_per_task: 每任务 CPU 数（默认 1）
+        memory_per_cpu: 每 CPU 内存字符串（默认 5G）
+        image_type: 镜像类型（默认 SOURCE_PRIVATE）
+        track: 是否追踪任务（默认 True）
+    """
+    api = get_api()
+    store = get_store()
+    warnings: list[str] = []
+
+    cookie_data = get_cookie()
+    if not cookie_data:
+        raise RuntimeError("未找到 cookie，请先调用 qz_auth_login。")
+    cookie = cookie_data.get("cookie", "")
+    if not cookie:
+        raise RuntimeError("cookie 为空，请先调用 qz_auth_login。")
+
+    # Resolve workspace
+    if workspace.startswith("ws-"):
+        workspace_id = workspace
+    else:
+        workspace_id = find_workspace_by_name(workspace)
+        if not workspace_id:
+            raise RuntimeError(f"未找到名称为 '{workspace}' 的工作空间。请先运行 qz_refresh_resources。")
+
+    # Resolve project
+    if project:
+        if project.startswith("project-"):
+            project_id = project
+        else:
+            project_id, _ = _resolve_resource_id_mcp(workspace_id, "projects", project)
+            if not project_id:
+                raise RuntimeError(f"未找到项目 '{project}'。")
+    else:
+        project_id, proj_name = _auto_select_resource_mcp(workspace_id, "projects")
+        if not project_id:
+            raise RuntimeError("未指定项目且缓存中无可用项目。请指定 project 或先调用 qz_refresh_resources。")
+        warnings.append(f"自动选择项目: {proj_name} ({project_id})")
+
+    result = api.create_hpc_job(
+        cookie=cookie,
+        job_name=name,
+        workspace_id=workspace_id,
+        project_id=project_id,
+        logic_compute_group_id=compute_group,
+        entrypoint=entrypoint,
+        image=image,
+        predef_quota_id=predef_quota_id,
+        cpu=cpu,
+        mem_gi=mem_gi,
+        instances=instances,
+        cpus_per_task=cpus_per_task,
+        memory_per_cpu=memory_per_cpu,
+        image_type=image_type,
+    )
+
+    job_id = result.get("job_id", "")
+    if not job_id:
+        raise RuntimeError(f"任务创建失败: 响应中未包含 job_id。raw={result}")
+
+    job_url = f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}"
+
+    if track:
+        job = JobRecord(
+            job_id=job_id,
+            name=name,
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source="qz_create_hpc_job",
+            command=entrypoint,
+            url=job_url,
+            instance_count=instances,
+        )
+        store.add(job)
+
+    return _result(
+        {
+            "job_id": job_id,
+            "workspace_id": workspace_id,
+            "url": job_url,
+            "name": name,
+            "tracked": track,
+        },
+        message="HPC 任务创建成功。",
+        warnings=warnings,
+    )
+
+
+@server.tool()
+def qz_get_hpc_usage(
+    workspace: str = "",
+    compute_group: str = "",
+    verbose: bool = False,
+    top: int = 30,
+) -> dict[str, Any]:
+    """
+    查看 HPC 节点的 CPU/内存利用率。
+
+    通过 /api/v1/cluster_metric/list_node_dimension 接口获取各 HPC 节点实时
+    CPU 和内存使用率，并按工作空间汇总统计。
+
+    Args:
+        workspace: 工作空间 ID 或名称，空字符串表示查询所有已缓存工作空间
+        compute_group: 计算组 ID（lcg-...），空字符串表示查所有 HPC 节点
+        verbose: 是否返回每个节点的详细数据（默认 False）
+        top: verbose=True 时返回 CPU 利用率最高的前 N 个节点（默认 30）
+    """
+    cookie, warnings = _require_cookie()
+    workspace_refs = _resolve_workspace_refs(workspace or None, all_workspaces=not bool(workspace))
+    api = get_api()
+    all_stats = []
+
+    for workspace_ref in workspace_refs:
+        workspace_id = workspace_ref["id"]
+        workspace_name = workspace_ref.get("name", "")
+        try:
+            nodes: list[dict] = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=compute_group or None,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                total = data.get("total", 0)
+                nodes.extend(batch)
+                if len(nodes) >= total or len(batch) < page_size:
+                    break
+                page_num += 1
+
+            hpc_nodes = [n for n in nodes if n.get("node_type", "") == "hpc"]
+            if not hpc_nodes:
+                continue
+
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            total_nodes = len(hpc_nodes)
+            avg_cpu = sum(cpu_rates) / total_nodes if total_nodes else 0
+            avg_mem = sum(mem_rates) / total_nodes if total_nodes else 0
+            busy_nodes = sum(1 for r in cpu_rates if r > 0.05)
+
+            stat: dict[str, Any] = {
+                "workspace_id": workspace_id,
+                "workspace_name": workspace_name,
+                "total_hpc_nodes": total_nodes,
+                "busy_nodes": busy_nodes,
+                "avg_cpu_usage_pct": round(avg_cpu * 100, 2),
+                "avg_mem_usage_pct": round(avg_mem * 100, 2),
+            }
+
+            if verbose:
+                sorted_nodes = sorted(hpc_nodes, key=lambda n: -n.get("cpu", {}).get("usage_rate", 0))
+                stat["nodes"] = [
+                    {
+                        "name": n.get("name", ""),
+                        "cpu_usage_pct": round(n.get("cpu", {}).get("usage_rate", 0) * 100, 2),
+                        "mem_usage_pct": round(n.get("memory", {}).get("usage_rate", 0) * 100, 2),
+                        "cpu_used": n.get("cpu", {}).get("used", 0),
+                        "cpu_total": n.get("cpu", {}).get("total", 0),
+                        "mem_used_gib": round(n.get("memory", {}).get("used", 0), 2),
+                        "mem_total_gib": round(n.get("memory", {}).get("total", 0), 2),
+                    }
+                    for n in sorted_nodes[:top]
+                ]
+
+            all_stats.append(stat)
+        except Exception as exc:
+            warnings.append(f"{workspace_name or workspace_id}: {exc}")
+
+    return _result(
+        {
+            "workspace_count": len(all_stats),
+            "workspaces": all_stats,
+        },
+        warnings=warnings,
+    )
+
+
 def main() -> None:
     server.run(transport="stdio")
 

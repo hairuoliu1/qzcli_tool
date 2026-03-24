@@ -1498,6 +1498,47 @@ def cmd_avail(args):
                     display.print(f'WORKSPACE_ID="{r["workspace_id"]}"')
                     display.print(f'LOGIC_COMPUTE_GROUP_ID="{r["id"]}"')
     
+    # HPC 节点 CPU/内存利用率汇总
+    hpc_any = False
+    lcg_filter = group_filter if group_filter and group_filter.startswith("lcg-") else None
+    for workspace_id in workspace_ids:
+        cached = get_workspace_resources(workspace_id)
+        ws_label = cached.get("name", workspace_id) if cached else workspace_id
+        try:
+            hpc_nodes = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=lcg_filter,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                hpc_nodes.extend(b for b in batch if b.get("node_type") == "hpc")
+                if len(batch) < page_size:
+                    break
+                page_num += 1
+            if not hpc_nodes:
+                continue
+            if not hpc_any:
+                display.print(f"\n[bold]HPC 节点 CPU/内存利用率[/bold]")
+                hpc_any = True
+            total_hpc = len(hpc_nodes)
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            avg_cpu = sum(cpu_rates) / total_hpc * 100
+            avg_mem = sum(mem_rates) / total_hpc * 100
+            busy = sum(1 for r in cpu_rates if r > 0.05)
+            display.print(
+                f"  {ws_label}: 节点 {total_hpc} | 忙碌 {busy} "
+                f"| 平均CPU [cyan]{avg_cpu:.1f}%[/cyan] "
+                f"| 平均MEM [cyan]{avg_mem:.1f}%[/cyan]"
+            )
+        except Exception:
+            pass
+
     return 0
 
 
@@ -2075,6 +2116,201 @@ def cmd_create(args):
             "name": args.name,
         }
         print(json_mod.dumps(output, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_hpc(args):
+    """提交 HPC/CPU 任务"""
+    import json as json_mod
+    display = get_display()
+    api = get_api()
+    store = get_store()
+
+    cookie_data = get_cookie()
+    if not cookie_data:
+        display.print_error("未找到 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data.get("cookie", "")
+    if not cookie:
+        display.print_error("cookie 为空，请先运行: qzcli login")
+        return 1
+
+    # Resolve workspace
+    workspace_id = args.workspace
+    if not workspace_id.startswith("ws-"):
+        workspace_id = find_workspace_by_name(args.workspace)
+        if not workspace_id:
+            display.print_error(f"未找到名称为 '{args.workspace}' 的工作空间")
+            return 1
+
+    # Resolve project
+    project_id = args.project
+    if project_id and not project_id.startswith("project-"):
+        pid, _ = _resolve_resource_id(workspace_id, "projects", project_id)
+        if not pid:
+            display.print_error(f"未找到项目 '{args.project}'")
+            return 1
+        project_id = pid
+    if not project_id:
+        project_id, _ = _auto_select_resource(workspace_id, "projects")
+        if not project_id:
+            display.print_error("未指定项目且缓存中无可用项目，请用 --project 指定")
+            return 1
+
+    display.print(f"\n[bold]HPC 任务提交[/bold]")
+    display.print(f"  名称: {args.name}")
+    display.print(f"  计算组: {args.compute_group}")
+    display.print(f"  规格: {args.predef_quota_id} (cpu={args.cpu}, mem={args.mem_gi}GiB)")
+    display.print(f"  节点数: {args.instances}  cpus/task: {args.cpus_per_task}")
+    display.print(f"  命令: {args.entrypoint[:120]}{'...' if len(args.entrypoint) > 120 else ''}")
+    display.print("")
+
+    try:
+        result = api.create_hpc_job(
+            cookie=cookie,
+            job_name=args.name,
+            workspace_id=workspace_id,
+            project_id=project_id,
+            logic_compute_group_id=args.compute_group,
+            entrypoint=args.entrypoint,
+            image=args.image,
+            predef_quota_id=args.predef_quota_id,
+            cpu=args.cpu,
+            mem_gi=args.mem_gi,
+            instances=args.instances,
+            cpus_per_task=args.cpus_per_task,
+            memory_per_cpu=args.memory_per_cpu,
+            image_type=args.image_type,
+        )
+    except QzAPIError as e:
+        display.print_error(f"任务创建失败: {e}")
+        return 1
+
+    job_id = result.get("job_id", "")
+    if not job_id:
+        display.print_error("任务创建失败: 响应中未包含 job_id")
+        if args.output_json:
+            print(json_mod.dumps(result, indent=2, ensure_ascii=False))
+        return 1
+
+    job_url = f"https://qz.sii.edu.cn/jobs/hpc?spaceId={workspace_id}"
+    display.print_success(f"HPC 任务创建成功!")
+    display.print(f"  Job ID: [cyan]{job_id}[/cyan]")
+    display.print(f"  链接: {job_url}")
+
+    if not args.no_track:
+        job = JobRecord(
+            job_id=job_id,
+            name=args.name,
+            status="job_pending",
+            workspace_id=workspace_id,
+            project_id=project_id,
+            source="qzcli hpc",
+            command=args.entrypoint,
+            url=job_url,
+            instance_count=args.instances,
+        )
+        store.add(job)
+        display.print("  [dim]已自动追踪到本地[/dim]")
+
+    if args.output_json:
+        print(json_mod.dumps({"job_id": job_id, "workspace_id": workspace_id, "url": job_url, "name": args.name}, ensure_ascii=False))
+
+    return 0
+
+
+def cmd_hpc_usage(args):
+    """查看 HPC 任务 CPU/内存利用率（基于节点维度统计）"""
+    display = get_display()
+    api = get_api()
+
+    cookie_data = get_cookie()
+    if not cookie_data or not cookie_data.get("cookie"):
+        display.print_error("未设置 cookie，请先运行: qzcli login")
+        return 1
+    cookie = cookie_data["cookie"]
+
+    workspace_input = args.workspace
+    if not workspace_input:
+        all_resources = load_all_resources()
+        if not all_resources:
+            display.print_error("没有已缓存的工作空间，请先运行: qzcli res -u")
+            return 1
+        workspace_ids = [(ws_id, data.get("name", "")) for ws_id, data in all_resources.items()]
+    elif workspace_input.startswith("ws-"):
+        ws_resources = get_workspace_resources(workspace_input)
+        workspace_ids = [(workspace_input, ws_resources.get("name", "") if ws_resources else "")]
+    else:
+        wid = find_workspace_by_name(workspace_input)
+        if not wid:
+            display.print_error(f"未找到名称为 '{workspace_input}' 的工作空间")
+            return 1
+        ws_resources = get_workspace_resources(wid)
+        workspace_ids = [(wid, ws_resources.get("name", wid) if ws_resources else wid)]
+
+    lcg_id = args.compute_group or ""
+
+    for workspace_id, ws_name in workspace_ids:
+        display.print(f"[dim]正在查询 {ws_name or workspace_id} 的 HPC 节点利用率...[/dim]")
+        try:
+            # 分页获取所有节点
+            nodes = []
+            page_num = 1
+            page_size = 200
+            while True:
+                data = api.list_node_dimension(
+                    workspace_id, cookie,
+                    logic_compute_group_id=lcg_id or None,
+                    page_num=page_num,
+                    page_size=page_size,
+                )
+                batch = data.get("node_dimensions", [])
+                total = data.get("total", 0)
+                nodes.extend(batch)
+                if len(nodes) >= total or len(batch) < page_size:
+                    break
+                page_num += 1
+
+            # 只保留 HPC 节点
+            hpc_nodes = [n for n in nodes if n.get("node_type", "") == "hpc"]
+            if not hpc_nodes:
+                display.print(f"  [dim]{ws_name or workspace_id}: 无 HPC 节点[/dim]")
+                continue
+
+            total_nodes = len(hpc_nodes)
+            cpu_rates = [n.get("cpu", {}).get("usage_rate", 0) for n in hpc_nodes]
+            mem_rates = [n.get("memory", {}).get("usage_rate", 0) for n in hpc_nodes]
+            avg_cpu = sum(cpu_rates) / total_nodes * 100
+            avg_mem = sum(mem_rates) / total_nodes * 100
+            busy_nodes = sum(1 for r in cpu_rates if r > 0.05)
+
+            display.print(f"\n[bold]{ws_name or workspace_id}[/bold]")
+            display.print(f"  HPC 节点总数: {total_nodes}  忙碌节点 (CPU>5%): {busy_nodes}")
+            display.print(f"  平均 CPU 利用率: [cyan]{avg_cpu:.1f}%[/cyan]")
+            display.print(f"  平均内存利用率: [cyan]{avg_mem:.1f}%[/cyan]")
+
+            if args.verbose:
+                display.print(f"\n  {'节点名称':<20} {'CPU%':>7} {'MEM%':>7} {'CPU用/总':>12} {'MEM用/总(GiB)':>16}")
+                display.print("  " + "-" * 65)
+                sort_key = lambda n: -n.get("cpu", {}).get("usage_rate", 0)
+                for node in sorted(hpc_nodes, key=sort_key)[:args.top]:
+                    name = node.get("name", "")
+                    cpu = node.get("cpu", {})
+                    mem = node.get("memory", {})
+                    cpu_pct = cpu.get("usage_rate", 0) * 100
+                    mem_pct = mem.get("usage_rate", 0) * 100
+                    cpu_used = cpu.get("used", 0)
+                    cpu_total = cpu.get("total", 0)
+                    mem_used = mem.get("used", 0)
+                    mem_total = mem.get("total", 0)
+                    display.print(f"  {name:<20} {cpu_pct:>6.1f}% {mem_pct:>6.1f}% {cpu_used:>5}/{cpu_total:<5} {mem_used:>7.1f}/{mem_total:<7.1f}")
+
+        except QzAPIError as e:
+            if "401" in str(e) or "过期" in str(e):
+                display.print_error("Cookie 已过期，请重新设置: qzcli login")
+                return 1
+            display.print_warning(f"查询 {ws_name or workspace_id} 失败: {e}")
 
     return 0
 
@@ -2674,6 +2910,29 @@ def main():
     create_parser.add_argument("--json", dest="output_json", action="store_true", help="输出 JSON 格式（供脚本集成）")
     
     # batch 命令 - 批量提交任务
+    hpc_parser = subparsers.add_parser("hpc", help="提交 HPC/CPU 任务到启智平台")
+    hpc_parser.add_argument("--name", required=True, help="任务名称")
+    hpc_parser.add_argument("--workspace", required=True, help="工作空间名称或 ID")
+    hpc_parser.add_argument("--project", default="", help="项目名称或 ID（省略则自动选择）")
+    hpc_parser.add_argument("--compute-group", dest="compute_group", required=True, help="计算组 ID（lcg-...）")
+    hpc_parser.add_argument("--predef-quota-id", dest="predef_quota_id", required=True, help="预定义配额 ID")
+    hpc_parser.add_argument("--cpu", type=int, required=True, help="每节点 CPU 核心数")
+    hpc_parser.add_argument("--mem-gi", dest="mem_gi", type=int, required=True, help="每节点内存 GiB")
+    hpc_parser.add_argument("--instances", type=int, default=1, help="节点数（默认 1）")
+    hpc_parser.add_argument("--cpus-per-task", dest="cpus_per_task", type=int, default=1, help="每任务 CPU 数（默认同 --cpu）")
+    hpc_parser.add_argument("--memory-per-cpu", dest="memory_per_cpu", default="5G", help="每 CPU 内存（默认 5G）")
+    hpc_parser.add_argument("--image", required=True, help="容器镜像地址")
+    hpc_parser.add_argument("--image-type", dest="image_type", default="SOURCE_PRIVATE", help="镜像类型（默认 SOURCE_PRIVATE）")
+    hpc_parser.add_argument("--entrypoint", required=True, help="运行命令")
+    hpc_parser.add_argument("--no-track", action="store_true", help="不追踪任务")
+    hpc_parser.add_argument("--json", dest="output_json", action="store_true", help="JSON 输出")
+
+    hpc_usage_parser = subparsers.add_parser("hpc-usage", help="查看 HPC 节点 CPU/内存利用率")
+    hpc_usage_parser.add_argument("--workspace", "-w", help="工作空间 ID 或名称（默认查询所有已缓存工作空间）")
+    hpc_usage_parser.add_argument("--compute-group", dest="compute_group", default="", help="计算组 ID（lcg-...），省略则查所有 HPC 节点")
+    hpc_usage_parser.add_argument("--verbose", "-v", action="store_true", help="显示每个节点的详细利用率")
+    hpc_usage_parser.add_argument("--top", type=int, default=30, help="详细模式下显示前 N 个节点（默认 30）")
+
     batch_parser = subparsers.add_parser("batch", help="从 JSON 配置文件批量提交任务")
     batch_parser.add_argument("config", help="批量配置文件路径（JSON 格式）")
     batch_parser.add_argument("--dry-run", action="store_true", help="只预览不提交")
@@ -2715,6 +2974,8 @@ def main():
         "usage": cmd_usage,
         "create": cmd_create,
         "create-job": cmd_create,
+        "hpc": cmd_hpc,
+        "hpc-usage": cmd_hpc_usage,
         "batch": cmd_batch,
     }
     
